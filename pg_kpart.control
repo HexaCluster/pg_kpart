@@ -1,0 +1,5 @@
+# pg_kpart extension
+comment = 'Reject queries that scan all partitions without using the partition key'
+default_version = '1.0'
+module_pathname = '$libdir/pg_kpart'
+relocatable = true
