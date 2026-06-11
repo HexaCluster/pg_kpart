@@ -111,7 +111,7 @@ END $$;
   is treated as a full scan and rejected - it is one, in practice.
 * The check also covers `UPDATE`/`DELETE` and `EXPLAIN` (without `ANALYZE`),
   since those go through the planner too.
-* Tested on PostgreSQL >= 13.
+* Tested on PostgreSQL >= 14.
 
 ## Authors
 
