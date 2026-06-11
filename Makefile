@@ -12,6 +12,6 @@ TESTS        = pg_kpart_test
 REGRESS      = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test
 
-PG_CONFIG ?= /usr/lib/postgresql/17/bin/pg_config
+PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
