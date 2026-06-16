@@ -107,6 +107,15 @@ END $$;
 
 ## Notes & limitations
 
+* The check is a guardrail, not a hard barrier. `pg_kpart.enabled` and
+  `pg_kpart.message_level` are `USERSET` GUCs, so any role can run
+  `SET pg_kpart.enabled = off` (or lower the message level) to bypass
+  enforcement for its own session. Treat it as protection against accidental
+  full scans, not as a security control against deliberate ones.
+* Enforcement happens at plan time, inside the planner hook. A prepared
+  statement or cached generic plan is checked only when it is actually
+  (re)planned; repeated `EXECUTE` of an already-cached full-scan plan will not
+  re-trigger the check.
 * A predicate that happens to match *all* partitions (e.g. `logdate > '1900-01-01'`)
   is treated as a full scan and rejected - it is one, in practice.
 * The check also covers `UPDATE`/`DELETE` and `EXPLAIN` (without `ANALYZE`),
