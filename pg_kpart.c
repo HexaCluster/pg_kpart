@@ -506,16 +506,28 @@ check_planned_stmt(PlannedStmt *pstmt)
 
 static PlannedStmt *
 pg_kpart_planner(Query *parse, const char *query_string, int cursorOptions,
-				 ParamListInfo boundParams)
+				 ParamListInfo boundParams
+#if PG_VERSION_NUM >= 190000
+				 , ExplainState *es
+#endif
+				 )
 {
 	PlannedStmt *result;
 
 	if (prev_planner_hook)
 		result = prev_planner_hook(parse, query_string, cursorOptions,
-								   boundParams);
+								   boundParams
+#if PG_VERSION_NUM >= 190000
+								   , es
+#endif
+								   );
 	else
 		result = standard_planner(parse, query_string, cursorOptions,
-								  boundParams);
+								  boundParams
+#if PG_VERSION_NUM >= 150000
+								   , es
+#endif
+								  );
 
 	if (pg_kpart_enabled &&
 		result != NULL &&
