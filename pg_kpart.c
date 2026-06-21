@@ -524,7 +524,7 @@ pg_kpart_planner(Query *parse, const char *query_string, int cursorOptions,
 	else
 		result = standard_planner(parse, query_string, cursorOptions,
 								  boundParams
-#if PG_VERSION_NUM >= 150000
+#if PG_VERSION_NUM >= 190000
 								   , es
 #endif
 								  );
