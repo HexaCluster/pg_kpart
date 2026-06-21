@@ -62,6 +62,7 @@ PG_MODULE_MAGIC;
 /* ---- GUC-backed configuration ---- */
 static bool pg_kpart_enabled = true;
 static bool pg_kpart_check_superuser = false;
+static bool pg_kpart_nouser_change = false;
 static int  pg_kpart_min_partitions = 2;
 static int  pg_kpart_message_level = ERROR;
 static char *pg_kpart_blacklist = NULL;
@@ -545,14 +546,7 @@ pg_kpart_planner(Query *parse, const char *query_string, int cursorOptions,
 void
 _PG_init(void)
 {
-	DefineCustomBoolVariable("pg_kpart.enabled",
-							 "Enable enforcement of partition-key usage.",
-							 NULL,
-							 &pg_kpart_enabled,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
+	GucContext context = PGC_USERSET;
 
 	DefineCustomBoolVariable("pg_kpart.check_superuser",
 							 "Apply the check to superusers as well.",
@@ -563,12 +557,32 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pg_kpart.nouser_change",
+							 "Disallow non superusers to change the settings of the pg_kpart extension.",
+							 NULL,
+							 &pg_kpart_nouser_change,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	if (pg_kpart_nouser_change)
+		context = PGC_SUSET;
+
+	DefineCustomBoolVariable("pg_kpart.enabled",
+							 "Enable enforcement of partition-key usage.",
+							 NULL,
+							 &pg_kpart_enabled,
+							 true,
+							 context,
+							 0,
+							 NULL, NULL, NULL);
 	DefineCustomIntVariable("pg_kpart.min_partitions",
 							"Minimum number of leaf partitions before the check applies.",
 							NULL,
 							&pg_kpart_min_partitions,
 							2, 1, INT_MAX,
-							PGC_USERSET,
+							context,
 							0,
 							NULL, NULL, NULL);
 
@@ -578,7 +592,7 @@ _PG_init(void)
 							 &pg_kpart_message_level,
 							 ERROR,
 							 message_level_options,
-							 PGC_USERSET,
+							 context,
 							 0,
 							 NULL, NULL, NULL);
 
@@ -590,7 +604,7 @@ _PG_init(void)
 							   "partitioned tables.",
 							   &pg_kpart_blacklist,
 							   "",
-							   PGC_USERSET,
+							   context,
 							   GUC_LIST_INPUT,
 							   NULL, NULL, NULL);
 
@@ -600,7 +614,7 @@ _PG_init(void)
 							   "Ignored when pg_kpart.blacklisted is set.",
 							   &pg_kpart_whitelist,
 							   "",
-							   PGC_USERSET,
+							   context,
 							   GUC_LIST_INPUT,
 							   NULL, NULL, NULL);
 

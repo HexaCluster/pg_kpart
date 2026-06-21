@@ -56,6 +56,7 @@ The `CREATE EXTENSION` step is optional and may be used just to register the ext
 | `pg_kpart.check_superuser` | `off` | When `off`, superusers bypass the check. |
 | `pg_kpart.blacklisted` | _(empty)_ | Comma-separated partitioned tables the check applies to, **and their sub-partitions**. When set, only these tables are checked and `pg_kpart.whitelisted` is ignored. Empty = all partitioned tables. |
 | `pg_kpart.whitelisted` | _(empty)_ | Comma-separated partitioned tables exempt from the check, **and their sub-partitions**. Ignored when `pg_kpart.blacklisted` is set. |
+| `pg_kpart.nouser_change` | `off` | When `on`, disallow non superuser roles to mofidy the settings of the pg_kpart extension. |
 
 Names may be schema-qualified (`schema.table`); unqualified names are resolved
 through the current `search_path`. Listing a partitioned table also covers any
@@ -124,7 +125,9 @@ END $$;
   `pg_kpart.message_level` are `USERSET` GUCs, so any role can run
   `SET pg_kpart.enabled = off` (or lower the message level) to bypass
   enforcement for its own session. Treat it as protection against accidental
-  full scans, not as a security control against deliberate ones.
+  full scans, not as a security control against deliberate ones. If you want
+  to disallow non superuser roles to mofidy the pg_kpart settings, enable
+  `pg_kpart.nouser_change`.
 * Enforcement happens at plan time, inside the planner hook. A prepared
   statement or cached generic plan is checked only when it is actually
   (re)planned; repeated `EXECUTE` of an already-cached full-scan plan will not
