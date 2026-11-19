@@ -91,13 +91,28 @@ typedef struct KPartTimeWindows
 } KPartTimeWindows;
 
 /*
- * Since PG16 guc_malloc() allocates in GUCMemoryContext, so memory must be
- * released with guc_free(); before that it is plain malloc().
+ * GUC "extra" data allocation. Since PG16, guc_malloc()/guc_free() are
+ * exported and allocate in GUCMemoryContext, so they must be used. Before
+ * PG16, guc_malloc() is static to guc.c and extra data must be allocated
+ * with plain malloc(), guc.c releasing it with free().
  */
 #if PG_VERSION_NUM >= 160000
-#define KPART_GUC_FREE(p)	guc_free(p)
+#define KPART_GUC_MALLOC(sz)	guc_malloc(LOG, (sz))
+#define KPART_GUC_FREE(p)		guc_free(p)
 #else
-#define KPART_GUC_FREE(p)	free(p)
+static void *
+kpart_guc_malloc(size_t size)
+{
+	void	   *p = malloc(size);
+
+	if (p == NULL)
+		ereport(LOG,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+	return p;
+}
+#define KPART_GUC_MALLOC(sz)	kpart_guc_malloc(sz)
+#define KPART_GUC_FREE(p)		free(p)
 #endif
 
 /* ---- GUC-backed configuration ---- */
@@ -662,9 +677,8 @@ check_deny_creation(char **newval, void **extra, GucSource source)
 		if (*p == ',')
 			maxw++;
 
-	w = (KPartTimeWindows *) guc_malloc(LOG,
-										offsetof(KPartTimeWindows, windows) +
-										maxw * sizeof(KPartTimeWindow));
+	w = (KPartTimeWindows *) KPART_GUC_MALLOC(offsetof(KPartTimeWindows, windows) +
+											  maxw * sizeof(KPartTimeWindow));
 	if (w == NULL)
 		return false;
 	w->nwindows = 0;
