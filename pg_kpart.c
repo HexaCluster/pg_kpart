@@ -22,6 +22,11 @@
  * partition key spanning a few partitions) leaves fewer leaves than the
  * total, so it is accepted.
  *
+ * The module also installs a ProcessUtility_hook that can forbid the
+ * creation of new partitions (CREATE TABLE ... PARTITION OF and
+ * ALTER TABLE ... ATTACH PARTITION) during the time-of-day windows set in
+ * pg_kpart.deny_partition_creation.
+ *
  * Authors : Gilles Darold <gilles@darold.net>
  * IA      : IA drive, code review and fixes by the author.
  * Licence : PostgreSQL
@@ -30,6 +35,7 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <limits.h>
 
 #include "access/htup_details.h"
@@ -47,17 +53,52 @@
 #include "optimizer/planner.h"
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
+#include "pgtime.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 
 PG_MODULE_MAGIC;
 
 /* Custom SQLSTATE so applications can trap the condition (class "FS"). */
 #define ERRCODE_PG_KPART_VIOLATION MAKE_SQLSTATE('F', 'S', '0', '0', '1')
+/* Partition creation attempted during a forbidden time window. */
+#define ERRCODE_PG_KPART_CREATION_DENIED MAKE_SQLSTATE('F', 'S', '0', '0', '2')
+
+#define SECS_IN_DAY		(24 * 60 * 60)
+
+/*
+ * One time-of-day window, in seconds since midnight. The window is the
+ * half-open interval [start, end). When start > end the window wraps around
+ * midnight (e.g. 22:00-06:00).
+ */
+typedef struct KPartTimeWindow
+{
+	int			start;
+	int			end;
+} KPartTimeWindow;
+
+/* Parsed form of pg_kpart.deny_partition_creation (GUC "extra" data). */
+typedef struct KPartTimeWindows
+{
+	int			nwindows;
+	KPartTimeWindow windows[FLEXIBLE_ARRAY_MEMBER];
+} KPartTimeWindows;
+
+/*
+ * Since PG16 guc_malloc() allocates in GUCMemoryContext, so memory must be
+ * released with guc_free(); before that it is plain malloc().
+ */
+#if PG_VERSION_NUM >= 160000
+#define KPART_GUC_FREE(p)	guc_free(p)
+#else
+#define KPART_GUC_FREE(p)	free(p)
+#endif
 
 /* ---- GUC-backed configuration ---- */
 static bool pg_kpart_enabled = true;
@@ -67,6 +108,10 @@ static int  pg_kpart_min_partitions = 2;
 static int  pg_kpart_message_level = ERROR;
 static char *pg_kpart_blacklist = NULL;
 static char *pg_kpart_whitelist = NULL;
+static char *pg_kpart_deny_creation = NULL;
+
+/* Parsed windows, set by the assign hook; NULL means no restriction. */
+static KPartTimeWindows *deny_creation_windows = NULL;
 
 static const struct config_enum_entry message_level_options[] = {
 	{"debug", DEBUG2, true},
@@ -80,8 +125,9 @@ static const struct config_enum_entry message_level_options[] = {
 	{NULL, 0, false}
 };
 
-/* Saved previous hook (chaining). */
+/* Saved previous hooks (chaining). */
 static planner_hook_type prev_planner_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
 /* Walk context threaded through the recursion. */
 typedef struct KPartContext
@@ -541,6 +587,332 @@ pg_kpart_planner(Query *parse, const char *query_string, int cursorOptions,
 	return result;
 }
 
+/* ---- partition creation time windows ------------------------------------ */
+
+/*
+ * Parse a time of day "H:MM", "HH:MM" or "HH:MM:SS" at *p, advancing *p past
+ * it. 24:00[:00] is accepted (end of day). Returns false on bad syntax.
+ */
+static bool
+parse_time_of_day(const char **p, int *secs)
+{
+	const char *s = *p;
+	int			h = 0,
+				m = 0,
+				sec = 0,
+				nd;
+
+	for (nd = 0; nd < 2 && isdigit((unsigned char) *s); nd++, s++)
+		h = h * 10 + (*s - '0');
+	if (nd == 0 || *s != ':')
+		return false;
+	s++;
+
+	for (nd = 0; nd < 2 && isdigit((unsigned char) *s); nd++, s++)
+		m = m * 10 + (*s - '0');
+	if (nd != 2)
+		return false;
+
+	if (*s == ':')
+	{
+		s++;
+		for (nd = 0; nd < 2 && isdigit((unsigned char) *s); nd++, s++)
+			sec = sec * 10 + (*s - '0');
+		if (nd != 2)
+			return false;
+	}
+
+	if (h > 24 || m > 59 || sec > 59 || (h == 24 && (m != 0 || sec != 0)))
+		return false;
+
+	*secs = h * 3600 + m * 60 + sec;
+	*p = s;
+	return true;
+}
+
+/* Format seconds since midnight as HH:MM, or HH:MM:SS when needed. */
+static void
+format_time_of_day(int secs, char *buf, size_t len)
+{
+	if (secs % 60 != 0)
+		snprintf(buf, len, "%02d:%02d:%02d",
+				 secs / 3600, (secs / 60) % 60, secs % 60);
+	else
+		snprintf(buf, len, "%02d:%02d", secs / 3600, (secs / 60) % 60);
+}
+
+/*
+ * GUC check hook for pg_kpart.deny_partition_creation.
+ *
+ * Accepts a comma-separated list of "HH:MM[:SS]-HH:MM[:SS]" ranges. Empty
+ * items are ignored; an empty value means no restriction. The parsed windows
+ * are handed to the assign hook through *extra.
+ */
+static bool
+check_deny_creation(char **newval, void **extra, GucSource source)
+{
+	const char *p = *newval;
+	int			maxw = 1;
+	KPartTimeWindows *w;
+
+	if (p == NULL)
+		p = "";
+
+	for (; *p; p++)
+		if (*p == ',')
+			maxw++;
+
+	w = (KPartTimeWindows *) guc_malloc(LOG,
+										offsetof(KPartTimeWindows, windows) +
+										maxw * sizeof(KPartTimeWindow));
+	if (w == NULL)
+		return false;
+	w->nwindows = 0;
+
+	p = (*newval != NULL) ? *newval : "";
+	for (;;)
+	{
+		int			start,
+					end;
+
+		while (isspace((unsigned char) *p))
+			p++;
+		if (*p == '\0')
+			break;
+		if (*p == ',')
+		{
+			p++;
+			continue;
+		}
+
+		if (!parse_time_of_day(&p, &start))
+			goto syntax_error;
+		while (isspace((unsigned char) *p))
+			p++;
+		if (*p != '-')
+			goto syntax_error;
+		p++;
+		while (isspace((unsigned char) *p))
+			p++;
+		if (!parse_time_of_day(&p, &end))
+			goto syntax_error;
+		while (isspace((unsigned char) *p))
+			p++;
+		if (*p != ',' && *p != '\0')
+			goto syntax_error;
+
+		if (start == SECS_IN_DAY)
+		{
+			GUC_check_errdetail("24:00 is only allowed as the end of a time window.");
+			KPART_GUC_FREE(w);
+			return false;
+		}
+		if (start == end)
+		{
+			GUC_check_errdetail("A time window must not start and end at the same time.");
+			KPART_GUC_FREE(w);
+			return false;
+		}
+
+		Assert(w->nwindows < maxw);
+		w->windows[w->nwindows].start = start;
+		w->windows[w->nwindows].end = end;
+		w->nwindows++;
+	}
+
+	*extra = w;
+	return true;
+
+syntax_error:
+	GUC_check_errdetail("Expected a comma-separated list of time windows "
+						"in the form HH:MM[:SS]-HH:MM[:SS].");
+	KPART_GUC_FREE(w);
+	return false;
+}
+
+static void
+assign_deny_creation(const char *newval, void *extra)
+{
+	KPartTimeWindows *w = (KPartTimeWindows *) extra;
+
+	deny_creation_windows = (w != NULL && w->nwindows > 0) ? w : NULL;
+}
+
+/*
+ * Is the current wall-clock time, read in the server's log_timezone, inside
+ * one of the forbidden windows? log_timezone is used rather than the session
+ * TimeZone because the latter can be changed by any user to dodge the rule.
+ * On a match, *hit is the matching window and *now_secs the current time of
+ * day in seconds.
+ */
+static bool
+in_deny_creation_window(const KPartTimeWindow **hit, int *now_secs)
+{
+	struct pg_tm tm;
+	fsec_t		fsec;
+	int			tz;
+	int			t;
+	int			i;
+
+	if (deny_creation_windows == NULL)
+		return false;
+
+	if (timestamp2tm(GetCurrentTimestamp(), &tz, &tm, &fsec, NULL,
+					 log_timezone) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("timestamp out of range")));
+
+	t = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+
+	for (i = 0; i < deny_creation_windows->nwindows; i++)
+	{
+		const KPartTimeWindow *w = &deny_creation_windows->windows[i];
+		bool		inside;
+
+		if (w->start < w->end)
+			inside = (t >= w->start && t < w->end);
+		else					/* wraps around midnight */
+			inside = (t >= w->start || t < w->end);
+
+		if (inside)
+		{
+			*hit = w;
+			*now_secs = t;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* "schema.rel" or "rel", as written by the user. */
+static const char *
+rangevar_display_name(const RangeVar *rv)
+{
+	if (rv == NULL)
+		return "?";
+	if (rv->schemaname != NULL)
+		return psprintf("%s.%s", rv->schemaname, rv->relname);
+	return rv->relname;
+}
+
+/*
+ * Raise an error if parsetree creates a new partition (CREATE [FOREIGN] TABLE
+ * ... PARTITION OF, or ALTER TABLE ... ATTACH PARTITION) while the current
+ * time falls inside a forbidden window.
+ */
+static void
+check_partition_creation(Node *parsetree)
+{
+	RangeVar   *part = NULL;
+	RangeVar   *parent = NULL;
+	bool		attach = false;
+	const KPartTimeWindow *hit;
+	int			now_secs;
+	char		sbuf[16],
+				ebuf[16],
+				nbuf[16];
+
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+		case T_CreateForeignTableStmt:
+			{
+				/* CreateForeignTableStmt embeds a CreateStmt as first field */
+				CreateStmt *cs = (CreateStmt *) parsetree;
+
+				if (cs->partbound != NULL)
+				{
+					part = cs->relation;
+					if (cs->inhRelations != NIL)
+						parent = (RangeVar *) linitial(cs->inhRelations);
+				}
+			}
+			break;
+		case T_AlterTableStmt:
+			{
+				AlterTableStmt *ats = (AlterTableStmt *) parsetree;
+				ListCell   *lc;
+
+				/* Skip ALTER INDEX ... ATTACH PARTITION. */
+#if PG_VERSION_NUM >= 140000
+				if (ats->objtype != OBJECT_TABLE)
+#else
+				if (ats->relkind != OBJECT_TABLE)
+#endif
+					break;
+
+				foreach(lc, ats->cmds)
+				{
+					AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+					if (cmd->subtype == AT_AttachPartition)
+					{
+						part = ((PartitionCmd *) cmd->def)->name;
+						parent = ats->relation;
+						attach = true;
+						break;
+					}
+				}
+			}
+			break;
+		default:
+			break;
+	}
+
+	if (part == NULL)
+		return;
+
+	if (!in_deny_creation_window(&hit, &now_secs))
+		return;
+
+	format_time_of_day(hit->start, sbuf, sizeof(sbuf));
+	format_time_of_day(hit->end, ebuf, sizeof(ebuf));
+	format_time_of_day(now_secs, nbuf, sizeof(nbuf));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_PG_KPART_CREATION_DENIED),
+			 attach ?
+			 errmsg("attaching partition \"%s\" to table \"%s\" is not allowed at this time",
+					rangevar_display_name(part), rangevar_display_name(parent)) :
+			 errmsg("creation of partition \"%s\" of table \"%s\" is not allowed at this time",
+					rangevar_display_name(part), rangevar_display_name(parent)),
+			 errdetail("Partition creation is forbidden between %s and %s by pg_kpart.deny_partition_creation; current time is %s in time zone \"%s\".",
+					   sbuf, ebuf, nbuf, pg_get_timezone_name(log_timezone)),
+			 errhint("Retry outside of the forbidden time window.")));
+}
+
+/* ---- utility hook ------------------------------------------------------- */
+
+static void
+pg_kpart_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+#if PG_VERSION_NUM >= 140000
+						bool readOnlyTree,
+#endif
+						ProcessUtilityContext context,
+						ParamListInfo params,
+						QueryEnvironment *queryEnv,
+						DestReceiver *dest,
+						QueryCompletion *qc)
+{
+	/* Never interfere with pg_upgrade restoring the schema. */
+	if (deny_creation_windows != NULL && !IsBinaryUpgrade)
+		check_partition_creation(pstmt->utilityStmt);
+
+	if (prev_ProcessUtility_hook)
+		prev_ProcessUtility_hook(pstmt, queryString,
+#if PG_VERSION_NUM >= 140000
+								 readOnlyTree,
+#endif
+								 context, params, queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString,
+#if PG_VERSION_NUM >= 140000
+								readOnlyTree,
+#endif
+								context, params, queryEnv, dest, qc);
+}
+
 /* ---- module init / fini ------------------------------------------------- */
 
 void
@@ -618,6 +990,22 @@ _PG_init(void)
 							   GUC_LIST_INPUT,
 							   NULL, NULL, NULL);
 
+	DefineCustomStringVariable("pg_kpart.deny_partition_creation",
+							   "Comma-separated time-of-day windows during which "
+							   "partition creation is forbidden.",
+							   "Each window is HH:MM[:SS]-HH:MM[:SS], start included, "
+							   "end excluded, evaluated in log_timezone; a window may "
+							   "wrap around midnight (e.g. 22:00-06:00). Applies to "
+							   "CREATE TABLE ... PARTITION OF and ALTER TABLE ... "
+							   "ATTACH PARTITION, for all roles. Empty means no "
+							   "restriction.",
+							   &pg_kpart_deny_creation,
+							   "",
+							   context,
+							   GUC_LIST_INPUT,
+							   check_deny_creation,
+							   assign_deny_creation,
+							   NULL);
 
 #if PG_VERSION_NUM >= 150000
 	MarkGUCPrefixReserved("pg_kpart");
@@ -627,11 +1015,15 @@ _PG_init(void)
 
 	prev_planner_hook = planner_hook;
 	planner_hook = pg_kpart_planner;
+
+	prev_ProcessUtility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = pg_kpart_ProcessUtility;
 }
 
 void
 _PG_fini(void)
 {
 	planner_hook = prev_planner_hook;
+	ProcessUtility_hook = prev_ProcessUtility_hook;
 }
 
